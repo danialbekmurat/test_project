@@ -4,6 +4,9 @@ import json
 import os
 from html import escape
 from io import BytesIO
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -23,10 +26,13 @@ REACTION_TIMES = {
     "средняя": "в течение 24 часов",
     "высокая": "в течение 2 часов",
 }
+DATA_DIR = Path("data")
+PHOTO_DIR = DATA_DIR / "photos"
 
 
 def normalize_image(uploaded_file):
     """Открывает в том числе HEIC/HEIF и сжимает фото для Gemini."""
+    uploaded_file.seek(0)
     image = ImageOps.exif_transpose(Image.open(uploaded_file)).convert("RGB")
     image.thumbnail((1600, 1600))
     buffer = BytesIO()
@@ -34,12 +40,47 @@ def normalize_image(uploaded_file):
     return buffer.getvalue(), "image/jpeg"
 
 
+def estimate_request(description: str) -> dict[str, str]:
+    """Рабочий резервный сценарий, когда ключ Gemini ещё не настроен."""
+    text = description.lower()
+    if any(word in text for word in ("люк", "яма", "утеч", "провал", "искр", "газ")):
+        category, urgency, service = "Опасность на территории", "высокая", "аварийная служба"
+    elif any(word in text for word in ("мусор", "гряз", "урна", "подъезд", "уборк")):
+        category, urgency, service = "Уборка территории", "средняя", "клининговая компания"
+    elif any(word in text for word in ("дорог", "асфальт", "бордюр", "тротуар")):
+        category, urgency, service = "Дорожное покрытие", "средняя", "дорожная служба"
+    else:
+        category, urgency, service = "Обслуживание жилого комплекса", "средняя", "управляющая компания"
+    appeal = (
+        f"Прошу обратить внимание на проблему: {description.strip() or category.lower()}. "
+        "Прошу организовать проверку и сообщить о сроках устранения. Спасибо."
+    )
+    return {"category": category, "urgency": urgency, "service": service, "appeal_text": appeal}
+
+
+def save_request(image_bytes: bytes, description: str, result: dict[str, str], mode: str) -> str:
+    """Регистрирует обращение локально, не теряя фото и результат анализа."""
+    request_id = uuid4().hex[:8].upper()
+    DATA_DIR.mkdir(exist_ok=True)
+    PHOTO_DIR.mkdir(exist_ok=True)
+    photo_path = PHOTO_DIR / f"{request_id}.jpg"
+    photo_path.write_bytes(image_bytes)
+    record = {
+        "id": request_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "description": description,
+        "photo": str(photo_path),
+        "analysis_mode": mode,
+        **result,
+    }
+    with (DATA_DIR / "requests.jsonl").open("a", encoding="utf-8") as requests_file:
+        requests_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return request_id
+
+
 def analyze_request(image_bytes: bytes, mime_type: str, description: str) -> dict[str, str]:
     """Запрашивает у Gemini строго структурированный результат анализа."""
     api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("Не найден GEMINI_API_KEY. Добавьте ключ в файл .env.")
-
     prompt = f"""
 Ты — диспетчер обращений жителей жилого комплекса. Проанализируй фотографию и описание.
 Описание жителя: {description or "Описание не добавлено"}
@@ -119,14 +160,22 @@ st.markdown(
 
 with st.form("complaint_form"):
     st.markdown('<div class="form-hint">Прикрепите фото и кратко опишите, что произошло.</div>', unsafe_allow_html=True)
+    if os.getenv("GEMINI_API_KEY"):
+        st.caption("✦ Gemini подключён: используем анализ фотографии и описания.")
+    else:
+        st.caption("✦ Режим регистрации: заявка сохранится локально. Для анализа изображения Gemini добавьте ключ в .env.")
     photo = st.file_uploader(
         "Фото проблемы",
-        type=["jpg", "jpeg", "png", "webp", "heic", "heif"],
-        help="Поддерживаются JPG, PNG, WEBP и фото с iPhone в HEIC/HEIF.",
+        type=None,
+        help="Можно выбрать фотографию с любого устройства. JPG, PNG, WEBP, HEIC/HEIF и другие форматы будут проверены после загрузки.",
     )
     if photo:
         st.markdown('<div class="preview-label">Предпросмотр загруженного фото</div>', unsafe_allow_html=True)
-        st.image(photo, width=320)
+        try:
+            preview, _ = normalize_image(photo)
+            st.image(preview, width=320)
+        except (UnidentifiedImageError, OSError):
+            st.caption("Файл прикреплён. Предпросмотр недоступен — попробуйте отправить JPG, PNG, WEBP или HEIC/HEIF.")
     description = st.text_area(
         "Коротко опишите проблему",
         placeholder="Например: у второго подъезда переполнена урна",
@@ -140,10 +189,15 @@ if submitted:
     else:
         try:
             image_bytes, mime_type = normalize_image(photo)
-            with st.spinner("Анализируем обращение…"):
-                st.session_state.result = analyze_request(image_bytes, mime_type, description)
-        except ValueError as error:
-            st.error(str(error))
+            if os.getenv("GEMINI_API_KEY"):
+                with st.spinner("Анализируем обращение…"):
+                    result = analyze_request(image_bytes, mime_type, description)
+                mode = "gemini"
+            else:
+                result = estimate_request(description)
+                mode = "local_fallback"
+            st.session_state.result = result
+            st.session_state.request_id = save_request(image_bytes, description, result, mode)
         except (UnidentifiedImageError, OSError):
             st.error("Не удалось открыть это фото. Выберите JPG, PNG, WEBP или HEIC/HEIF и повторите попытку.")
         except Exception as error:
@@ -165,8 +219,9 @@ if result := st.session_state.get("result"):
     st.markdown("#### Готовый текст обращения")
     st.info(result["appeal_text"], icon="📝")
     reaction_time = REACTION_TIMES.get(result["urgency"].lower(), "в ближайшее время")
+    request_id = st.session_state.get("request_id", "—")
     st.markdown(
-        f'<div class="sent"><strong>✓ Заявка отправлена</strong><br>Служба: {escape(result["service"])}<br>'
-        f'Ориентировочное время реакции: {reaction_time}<br><small>Демонстрация: заявка фактически никуда не отправляется.</small></div>',
+        f'<div class="sent"><strong>✓ Заявка зарегистрирована № {request_id}</strong><br>Служба: {escape(result["service"])}<br>'
+        f'Ориентировочное время реакции: {reaction_time}<br><small>Фото и данные заявки сохранены локально.</small></div>',
         unsafe_allow_html=True,
     )
